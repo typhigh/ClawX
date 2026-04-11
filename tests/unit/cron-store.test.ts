@@ -11,33 +11,24 @@ vi.mock('@/lib/host-api', () => ({
   hostApiFetch: (...args: unknown[]) => mockHostApiFetch(...args),
 }));
 
-// Mock localStorage
-const localStorageMock = {
-  data: {} as Record<string, string>,
-  getItem: vi.fn((key: string) => localStorageMock.data[key] ?? null),
-  setItem: vi.fn((key: string, value: string) => { localStorageMock.data[key] = value; }),
-  removeItem: vi.fn((key: string) => { delete localStorageMock.data[key]; }),
-  clear: vi.fn(() => { localStorageMock.data = {}; }),
-};
-Object.defineProperty(global, 'localStorage', { value: localStorageMock });
-
 describe('Cron Store', () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    localStorageMock.data = {};
+    // Clear localStorage data between tests (global mock provided by setup.ts)
+    window.localStorage.clear();
     // Reset stores to default state
     useCronStore.setState({ jobs: [], loading: false, error: null });
     useChatStore.setState({ currentAgentId: 'main', currentSessionKey: 'agent:main:session-1' });
   });
 
   afterEach(() => {
-    localStorageMock.data = {};
+    window.localStorage.clear();
   });
 
   describe('fetchJobs', () => {
     it('preserves agentId from localStorage when Gateway does not return agentId', async () => {
       // Pre-populate localStorage with job -> agentId mapping
-      localStorageMock.data['cronAgentIdMap'] = JSON.stringify({
+      window.localStorage.data['cronAgentIdMap'] = JSON.stringify({
         'job-1': 'typ-2',
         'job-2': 'agent-3',
       });
@@ -57,7 +48,7 @@ describe('Cron Store', () => {
 
     it('preserves extra jobs not returned by Gateway', async () => {
       // Pre-populate localStorage
-      localStorageMock.data['cronAgentIdMap'] = JSON.stringify({});
+      window.localStorage.data['cronAgentIdMap'] = JSON.stringify({});
 
       // Set existing job in store
       useCronStore.setState({
@@ -116,7 +107,7 @@ describe('Cron Store', () => {
       expect((init as { body: string }).body).toContain('"agentId":"typ-2"');
 
       // Verify localStorage was updated
-      expect(localStorageMock.data['cronAgentIdMap']).toContain('typ-2');
+      expect(window.localStorage.data['cronAgentIdMap']).toContain('typ-2');
     });
 
     it('uses provided agentId when explicitly passed', async () => {
@@ -162,7 +153,7 @@ describe('Cron Store', () => {
         schedule: '0 9 * * *',
       });
 
-      const savedMap = JSON.parse(localStorageMock.data['cronAgentIdMap'] || '{}');
+      const savedMap = JSON.parse(window.localStorage.data['cronAgentIdMap'] || '{}');
       expect(savedMap['job-xyz']).toBe('custom-agent');
     });
   });
@@ -230,7 +221,7 @@ describe('Cron Store', () => {
       expect(mockHostApiFetch).toHaveBeenCalledTimes(2);
 
       // Verify localStorage updated with new job id
-      const savedMap = JSON.parse(localStorageMock.data['cronAgentIdMap'] || '{}');
+      const savedMap = JSON.parse(window.localStorage.data['cronAgentIdMap'] || '{}');
       expect(savedMap['job-1']).toBeUndefined();
       expect(savedMap['job-new']).toBe('new-agent');
     });
@@ -238,7 +229,7 @@ describe('Cron Store', () => {
 
   describe('deleteJob', () => {
     it('removes job from localStorage on delete', async () => {
-      localStorageMock.data['cronAgentIdMap'] = JSON.stringify({
+      window.localStorage.data['cronAgentIdMap'] = JSON.stringify({
         'job-1': 'typ-2',
         'job-2': 'main',
       });
@@ -247,7 +238,7 @@ describe('Cron Store', () => {
 
       await useCronStore.getState().deleteJob('job-1');
 
-      const savedMap = JSON.parse(localStorageMock.data['cronAgentIdMap'] || '{}');
+      const savedMap = JSON.parse(window.localStorage.data['cronAgentIdMap'] || '{}');
       expect(savedMap['job-1']).toBeUndefined();
       expect(savedMap['job-2']).toBe('main');
     });
