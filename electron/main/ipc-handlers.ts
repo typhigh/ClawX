@@ -6,6 +6,7 @@ import { ipcMain, BrowserWindow, shell, dialog, app, nativeImage } from 'electro
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, extname, basename } from 'node:path';
+import { readFile, readdir } from 'node:fs/promises';
 import crypto from 'node:crypto';
 import { GatewayManager } from '../gateway/manager';
 import { ClawHubService, ClawHubSearchParams, ClawHubInstallParams, ClawHubUninstallParams } from '../gateway/clawhub';
@@ -22,6 +23,7 @@ import {
 import { syncProxyConfigToOpenClaw } from '../utils/openclaw-proxy';
 import { buildOpenClawControlUiUrl } from '../utils/openclaw-control-ui';
 import { logger } from '../utils/logger';
+import { resolveAgentIdFromChannel } from '../utils/agent-config';
 import {
   saveChannelConfig,
   getChannelConfig,
@@ -1031,6 +1033,111 @@ function registerCronHandlers(gatewayManager: GatewayManager): void {
       throw error;
     }
   });
+
+  // Periodic cron job repair: checks for jobs with undefined agentId and repairs them
+  // This handles cases where cron jobs were created via openclaw CLI without specifying agent
+  const CRON_AGENT_REPAIR_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+  setInterval(async () => {
+    try {
+      const status = gatewayManager.getStatus();
+      if (status.state !== 'running') return;
+
+      const result = await gatewayManager.rpc('cron.list', { includeDisabled: true }) as { jobs?: Array<{ id: string; name: string; sessionTarget?: string; payload?: { kind: string }; delivery?: { mode: string; channel?: string; to?: string; accountId?: string }; state?: Record<string, unknown> }> };
+      const jobs = result?.jobs ?? [];
+
+      for (const job of jobs) {
+        const jobAgentId = (job as unknown as { agentId?: string }).agentId;
+        if (
+          (job.sessionTarget === 'isolated' || !job.sessionTarget) &&
+          job.payload?.kind === 'agentTurn' &&
+          job.delivery?.mode === 'announce' &&
+          job.delivery?.channel &&
+          jobAgentId === undefined
+        ) {
+          const channel = job.delivery.channel;
+          const accountId = job.delivery.accountId;
+          const toAddress = job.delivery.to;
+
+          let correctAgentId = await resolveAgentIdFromChannel(channel, accountId);
+
+          // If no accountId, try to resolve it from session history
+          let resolvedAccountId: string | null = null;
+          if (!correctAgentId && !accountId && toAddress) {
+            resolvedAccountId = await resolveAccountIdFromSessionHistory(toAddress, channel);
+            if (resolvedAccountId) {
+              correctAgentId = await resolveAgentIdFromChannel(channel, resolvedAccountId);
+            }
+          }
+
+          if (correctAgentId) {
+            console.debug(`Periodic repair: job "${job.name}" agentId undefined -> "${correctAgentId}"`);
+            // When accountId was resolved via to address, include it in the patch
+            const patch: Record<string, unknown> = { agentId: correctAgentId };
+            if (resolvedAccountId && !accountId) {
+              patch.delivery = { accountId: resolvedAccountId };
+            }
+            await gatewayManager.rpc('cron.update', { id: job.id, patch });
+          }
+        }
+      }
+    } catch (error) {
+      // Silently ignore errors in periodic repair to avoid spamming logs
+    }
+  }, CRON_AGENT_REPAIR_INTERVAL_MS);
+}
+
+// Helper: resolve accountId from session history by to address
+async function resolveAccountIdFromSessionHistory(toAddress: string, channelType: string): Promise<string | null> {
+  const agentsDir = join(getOpenClawConfigDir(), 'agents');
+
+  let agentDirs: Array<{ name: string; isDirectory: () => boolean }>;
+  try {
+    agentDirs = await readdir(agentsDir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+
+  for (const entry of agentDirs) {
+    if (!entry.isDirectory()) continue;
+
+    const sessionsPath = join(agentsDir, entry.name, 'sessions', 'sessions.json');
+    let raw: string;
+    try {
+      raw = await readFile(sessionsPath, 'utf8');
+    } catch {
+      continue;
+    }
+
+    if (!raw.trim()) continue;
+
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+
+    // sessions.json can be object keyed by sessionKey
+    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+      for (const [, sessionData] of Object.entries(parsed)) {
+        const session = sessionData as Record<string, unknown>;
+        const deliveryContext = session.deliveryContext as Record<string, unknown> | undefined;
+        if (
+          deliveryContext &&
+          typeof deliveryContext.to === 'string' &&
+          deliveryContext.to === toAddress &&
+          typeof deliveryContext.channel === 'string' &&
+          deliveryContext.channel === channelType
+        ) {
+          if (typeof deliveryContext.accountId === 'string') {
+            return deliveryContext.accountId;
+          }
+        }
+      }
+    }
+  }
+
+  return null;
 }
 
 /**

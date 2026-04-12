@@ -1,10 +1,76 @@
 import { readFile } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'http';
 import { join } from 'node:path';
+import { readdir } from 'node:fs/promises';
 import type { HostApiContext } from '../context';
 import { parseJsonBody, sendJson } from '../route-utils';
 import { getOpenClawConfigDir } from '../../utils/paths';
 import { toOpenClawChannelType, toUiChannelType } from '../../utils/channel-alias';
+import { resolveAgentIdFromChannel } from '../../utils/agent-config';
+
+/**
+ * Find agentId from session history by delivery "to" address.
+ * Efficiently searches only agent session directories for matching deliveryContext.to.
+ */
+/**
+ * Find accountId from session history by "to" address.
+ * Returns the accountId if found, or null if not found.
+ */
+async function resolveAccountIdFromSessionHistory(toAddress: string, channelType: string): Promise<string | null> {
+  const agentsDir = join(getOpenClawConfigDir(), 'agents');
+
+  let agentDirs: Array<{ name: string; isDirectory: () => boolean }>;
+  try {
+    agentDirs = await readdir(agentsDir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+
+  for (const entry of agentDirs) {
+    if (!entry.isDirectory()) continue;
+
+    const sessionsPath = join(agentsDir, entry.name, 'sessions', 'sessions.json');
+    let raw: string;
+    try {
+      raw = await readFile(sessionsPath, 'utf8');
+    } catch {
+      continue;
+    }
+
+    if (!raw.trim()) continue;
+
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+
+    // sessions.json can be object keyed by sessionKey OR { sessions: [...] }
+    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+      // Try object-keyed format: { "agent:agent:main": { deliveryContext: {...} } }
+      for (const [sessionKey, sessionData] of Object.entries(parsed)) {
+        if (typeof sessionKey !== 'string') continue;
+        const session = sessionData as Record<string, unknown>;
+        const deliveryContext = session.deliveryContext as Record<string, unknown> | undefined;
+        if (
+          deliveryContext &&
+          typeof deliveryContext.to === 'string' &&
+          deliveryContext.to === toAddress &&
+          typeof deliveryContext.channel === 'string' &&
+          deliveryContext.channel === channelType
+        ) {
+          if (typeof deliveryContext.accountId === 'string') {
+            console.debug(`resolveAccountIdFromSessionHistory: found accountId="${deliveryContext.accountId}" for to="${toAddress}"`);
+            return deliveryContext.accountId;
+          }
+        }
+      }
+    }
+  }
+
+  return null;
+}
 
 interface GatewayCronJob {
   id: string;
@@ -461,6 +527,14 @@ export async function handleCronRoutes(
         const result = await ctx.gatewayManager.rpc('cron.list', { includeDisabled: true }, 8000);
         const data = result as { jobs?: GatewayCronJob[] };
         jobs = data?.jobs ?? (Array.isArray(result) ? result as GatewayCronJob[] : []);
+
+        // DEBUG: log name and agentId for each job
+        console.debug('Fetched cron jobs from Gateway:');
+        for (const job of jobs) {
+          const jobAgentId = (job as unknown as { agentId?: string }).agentId;
+          const deliveryInfo = job.delivery ? `delivery={mode:${job.delivery.mode}, channel:${job.delivery.channel || '(none)'}, accountId:${job.delivery.accountId || '(none)'}, to:${job.delivery.to || '(none)'}}` : 'delivery=(none)';
+          console.debug(`  - name: "${job.name}", agentId: "${jobAgentId || '(undefined)'}", ${deliveryInfo}, sessionTarget: "${job.sessionTarget || '(none)'}", payload.kind: "${job.payload?.kind || '(none)'}"`);
+        }
       } catch {
         // Fallback: read cron.json directly when Gateway RPC fails/times out.
         try {
@@ -477,7 +551,8 @@ export async function handleCronRoutes(
 
       // Run repair in background — don't block the response.
       if (!usedFallback && jobs.length > 0) {
-        const jobsToRepair = jobs.filter((job) => {
+        // Repair 1: delivery channel missing
+        const jobsToRepairDelivery = jobs.filter((job) => {
           const isIsolatedAgent =
             (job.sessionTarget === 'isolated' || !job.sessionTarget) &&
             job.payload?.kind === 'agentTurn';
@@ -487,10 +562,10 @@ export async function handleCronRoutes(
             !job.delivery?.channel
           );
         });
-        if (jobsToRepair.length > 0) {
+        if (jobsToRepairDelivery.length > 0) {
           // Fire-and-forget: repair in background
           void (async () => {
-            for (const job of jobsToRepair) {
+            for (const job of jobsToRepairDelivery) {
               try {
                 await ctx.gatewayManager.rpc('cron.update', {
                   id: job.id,
@@ -502,13 +577,75 @@ export async function handleCronRoutes(
             }
           })();
           // Optimistically fix the response data
-          for (const job of jobsToRepair) {
+          for (const job of jobsToRepairDelivery) {
             job.delivery = { mode: 'none' };
             if (job.state?.lastError?.includes('Channel is required')) {
               job.state.lastError = undefined;
               job.state.lastStatus = 'ok';
             }
           }
+        }
+
+        // Repair 2: agentId is undefined for jobs with announce delivery
+        // Only repair undefined -> inferred agent, NOT main -> inferred agent
+        const jobsToRepairAgent = jobs.filter((job) => {
+          const jobAgentId = (job as unknown as { agentId?: string }).agentId;
+          return (
+            (job.sessionTarget === 'isolated' || !job.sessionTarget) &&
+            job.payload?.kind === 'agentTurn' &&
+            job.delivery?.mode === 'announce' &&
+            job.delivery?.channel &&
+            jobAgentId === undefined  // Only repair when agentId is completely undefined
+          );
+        });
+        if (jobsToRepairAgent.length > 0) {
+          console.debug(`Found ${jobsToRepairAgent.length} jobs needing agent repair:`);
+          for (const job of jobsToRepairAgent) {
+            console.debug(`  - Job "${job.name}" (id: ${job.id}): current agentId="${(job as unknown as { agentId?: string }).agentId || '(undefined)'}", channel="${job.delivery?.channel}", accountId="${job.delivery?.accountId || '(none)'}"`);
+          }
+          // Fire-and-forget: repair in background
+          void (async () => {
+            for (const job of jobsToRepairAgent) {
+              try {
+                const channel = toOpenClawChannelType(job.delivery!.channel!);
+                const accountId = job.delivery!.accountId;
+                const toAddress = job.delivery!.to;
+
+                // Try 1: resolve from channel + accountId binding
+                let correctAgentId = await resolveAgentIdFromChannel(channel, accountId);
+
+                // If no accountId, try to resolve it from session history using "to" address, then get agentId
+                let resolvedAccountId: string | null = null;
+                if (!correctAgentId && !accountId && toAddress) {
+                  console.debug(`No binding found for channel="${channel}", accountId="${accountId || '(none)'}", trying session history for to="${toAddress}"`);
+                  resolvedAccountId = await resolveAccountIdFromSessionHistory(toAddress, channel);
+                  if (resolvedAccountId) {
+                    console.debug(`Resolved accountId="${resolvedAccountId}" from session history, now resolving agentId`);
+                    correctAgentId = await resolveAgentIdFromChannel(channel, resolvedAccountId);
+                  }
+                }
+
+                if (correctAgentId) {
+                  console.debug(`Repairing job "${job.name}": agentId "${(job as unknown as { agentId?: string }).agentId || '(undefined)'}" -> "${correctAgentId}"`);
+                  // When accountId was resolved via to address, include it in the patch
+                  const patch: Record<string, unknown> = { agentId: correctAgentId };
+                  if (resolvedAccountId && !accountId) {
+                    patch.delivery = { accountId: resolvedAccountId };
+                  }
+                  await ctx.gatewayManager.rpc('cron.update', { id: job.id, patch });
+                  // Update the local job object so response reflects correct agentId
+                  (job as unknown as { agentId: string }).agentId = correctAgentId;
+                  if (resolvedAccountId && !accountId && job.delivery) {
+                    job.delivery.accountId = resolvedAccountId;
+                  }
+                } else {
+                  console.warn(`Could not resolve agent for job "${job.name}": channel="${channel}", accountId="${accountId || '(none)'}", to="${toAddress || '(none)'}"`);
+                }
+              } catch (error) {
+                console.error(`Failed to repair agent for job "${job.name}":`, error);
+              }
+            }
+          })();
         }
       }
 
@@ -532,6 +669,8 @@ export async function handleCronRoutes(
       const agentId = typeof input.agentId === 'string' && input.agentId.trim()
         ? input.agentId.trim()
         : 'main';
+      // DEBUG: log the input and resolved agentId
+      console.debug(`Creating cron job: name="${input.name}", input.agentId="${input.agentId || '(not provided)'}", resolved agentId="${agentId}"`);
       const delivery = normalizeCronDelivery(input.delivery);
       const unsupportedDeliveryError = getUnsupportedCronDeliveryError(delivery.channel);
       if (delivery.mode === 'announce' && unsupportedDeliveryError) {
