@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { CheckCircle2, ChevronDown, ChevronRight, CircleDashed, GitBranch, MessageSquare, Wrench, XCircle } from 'lucide-react';
+import { CheckCircle2, ChevronDown, ChevronRight, CircleDashed, GitBranch, Link, MessageSquare, Wrench, XCircle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
 import type { TaskStep } from './task-visualization';
@@ -79,6 +79,18 @@ function StepDetailCard({ step }: { step: TaskStep }) {
           {!isNarration && (
             <div className="flex min-w-0 items-center gap-2">
               <p className="shrink-0 text-sm font-medium text-muted-foreground">{displayLabel}</p>
+              {isTool && step.label === 'web_fetch' && step.url && (
+                <a
+                  href={step.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={(e) => e.stopPropagation()}
+                  className="shrink-0 text-muted-foreground hover:text-foreground"
+                  title={step.url}
+                >
+                  <Link className="h-3.5 w-3.5" />
+                </a>
+              )}
               {isTool && detailPreview && !expanded && (
                 <p className="min-w-0 truncate text-[12px] leading-4 text-muted-foreground/80">
                   {detailPreview}
